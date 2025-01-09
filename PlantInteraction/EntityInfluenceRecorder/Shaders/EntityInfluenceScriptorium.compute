@@ -1,0 +1,170 @@
+﻿struct InfluenceInfo
+{
+    // xyz: position; w: radius
+    float4 worldPositionRadius;
+    // xyz: velocity (currently unused); w: const (H0/(R0^2))
+    float4 worldVelocity;
+};
+
+
+/** Texture to transcribe influence info to.
+ *  Data layout of the influence texture A
+ *  R:  N.x
+ *  G:  N.y
+ *  B:  height of the object
+ *  A:  angle
+ */
+RWTexture2D<float4> _InfluenceTextureA;
+/** Texture to transcribe influence info to.
+ *  Data layout of the influence texture B
+ *  R:  velocity
+ *  G:  
+ *  B:  
+ *  A:  
+ */
+RWTexture2D<float4> _InfluenceTextureB;
+
+/**  
+ * x: 1 px = x units in world space (world size/texture size)
+ * y: texture px size (square texture)
+ * z: WS origin.x (origin is the lower left corner)
+ * w: WS origin.y
+ */
+float4 _InfluenceTextureParams;
+/**
+ * x: l0 
+ * y: lerp factor
+ * z: friction factor
+ * w: elastic factor (k/m)  
+ */
+float4 _InfluenceCtrlParams;
+// raw influence info data
+StructuredBuffer<InfluenceInfo> _InfluenceInfo;
+// valid length of influence info
+int _InfluenceInfoCount;
+/**
+ * x: Time.deltaTime
+ * y: 
+ * z:
+ * w:
+ */
+float4 _TimeParams;
+
+#pragma kernel TranscribeMethod1
+#pragma kernel TranscribeMethod2
+#pragma kernel Fade
+
+float LinearFriction(float vel)
+{
+    return vel * _InfluenceCtrlParams.z;
+}
+
+#define HALF_PI 1.5707963
+
+[numthreads(8,8,1)]
+void Fade(uint3 id: SV_DispatchThreadID)
+{
+    uint2 px = id.xy;
+    if (px.x >= _InfluenceTextureParams.y || px.y >= _InfluenceTextureParams.y) return;
+
+    float4 pxDataA = _InfluenceTextureA[px];
+    float4 pxDataB = _InfluenceTextureB[px];
+    
+    float2 normal = pxDataA.xy;
+    float h = pxDataA.z;
+    float v = pxDataB.x;
+    float a = pxDataA.w;
+    
+    // elastic force - gravity - friction
+    v += (_InfluenceCtrlParams.w * a - 9.8f * sin(a) - LinearFriction(v)) * _TimeParams.x;
+    float dx = v * _TimeParams.x;
+    float da = asin(dx/_InfluenceCtrlParams.x);
+    a = clamp(abs(a - da), 0 , a);
+    
+    _InfluenceTextureA[px] = float4(normal, h, a);
+    _InfluenceTextureB[px] = float4(v, 0, 0, 0);
+}
+
+// small entities, large quantity
+[numthreads(8,8,1)]
+void TranscribeMethod1(uint id: SV_GroupIndex)
+{
+    if (id >= _InfluenceInfoCount) return;
+    InfluenceInfo info = _InfluenceInfo[id];
+    float radius = info.worldPositionRadius.w;
+    float enttConst = info.worldVelocity.w;
+    int pxRadius = radius / _InfluenceTextureParams.x;
+    uint2 infoPxPos = (info.worldPositionRadius.xz - _InfluenceTextureParams.zw) / _InfluenceTextureParams.x;
+    for (int x = -pxRadius; x <= pxRadius; x++)
+    {
+        for (int y = -pxRadius; y <= pxRadius; y++)
+        {
+            int2 displacement = int2(x,y);
+            if (length(displacement) > pxRadius) continue;
+            uint2 px = infoPxPos + int2(x, y);
+            float4 pxDataA = _InfluenceTextureA[px];
+            float4 pxDataB = _InfluenceTextureB[px];
+            float2 thisPxWsPos = px * _InfluenceTextureParams.x  +  _InfluenceTextureParams.zw;
+            float2 displacementWS = thisPxWsPos - info.worldPositionRadius.xz;
+            float displacementLen = length(displacementWS);
+            float normalizedDist = displacementLen / radius;
+            float2 normal = pxDataA.xy;
+            float h = pxDataA.z;
+            float v = pxDataB.x;
+            float a = pxDataA.w;
+            v = 0; // static system, the velocity is nullified
+            // assume tangent. the other case is too complex to solve and doesn't provide more realism
+            float lerpStr = _TimeParams.x * _InfluenceCtrlParams.y;
+            a =  lerp(a, HALF_PI - atan(4 * enttConst * displacementLen), lerpStr);
+            normal = normalize(lerp(normal, displacement,lerpStr))*normalizedDist;
+            h = info.worldPositionRadius.y - info.worldVelocity.w + enttConst * displacementLen * displacementLen;
+            _InfluenceTextureA[px] = float4(normal, h, a);
+            _InfluenceTextureB[px] = float4(v, 0, 0, 0);
+        }
+    }
+}
+
+// large entities, small quantity
+[numthreads(8,8,1)]
+void TranscribeMethod2(uint3 id: SV_DispatchThreadID)
+{
+    
+    uint2 px = id.xy;
+    if (px.x >= _InfluenceTextureParams.y || px.y >= _InfluenceTextureParams.y) return;
+
+    float4 pxDataA = _InfluenceTextureA[px];
+    float4 pxDataB = _InfluenceTextureB[px];
+    
+    float2 normal = pxDataA.xy;
+    float h = pxDataA.z;
+    float v = pxDataB.x;
+    float a = pxDataA.w;
+    
+    // Iterate over each entity
+    for (int i = 0; i < _InfluenceInfoCount; i++)
+    {
+        // calc displacement from entity center to pixel position
+        InfluenceInfo info = _InfluenceInfo[i];
+        float radius = info.worldPositionRadius.w;
+        float enttConst = info.worldVelocity.w;
+        float2 infoWsPos = info.worldPositionRadius.xz;
+        float2 thisPxWsPos = px * _InfluenceTextureParams.x  +  _InfluenceTextureParams.zw;
+        float2 displacement = thisPxWsPos - infoWsPos;
+        float displacementLen = length(displacement);
+        float normalizedDist = displacementLen / radius;
+        // when normalizedDist <= 1, the entity provides supportive force.
+        if (normalizedDist <= 1)
+        {
+            v = 0; // static system, the velocity is nullified
+            // assume tangent. the other case is too complex to solve and doesn't provide more realism
+            float lerpStr = _TimeParams.x * _InfluenceCtrlParams.y;
+            a =  lerp(a, HALF_PI - atan(4 * enttConst * displacementLen), lerpStr);
+            normal = normalize(lerp(normal, displacement,lerpStr))*normalizedDist;
+            h = info.worldPositionRadius.y - info.worldVelocity.w + enttConst * displacementLen * displacementLen;
+            break;
+        }
+    }
+    
+    _InfluenceTextureA[px] = float4(normal, h, a);
+    _InfluenceTextureB[px] = float4(v, 0, 0, 0);
+}
